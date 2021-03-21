@@ -1121,22 +1121,7 @@ public class KubernetesExecutor extends JobExecutor implements Testable<TestData
 		List<String> labelUpdates = new ArrayList<>();
 
 		Iterator<Map.Entry<String, JsonNode>> it = nodeNode.get("metadata").get("labels").fields();
-		while (it.hasNext()) {
-			Map.Entry<String, JsonNode> entry = it.next();
-			if (entry.getKey().startsWith(CACHE_LABEL_PREFIX)) {
-				String cacheKey = entry.getKey().substring(CACHE_LABEL_PREFIX.length());
-				int labelValue = entry.getValue().asInt();
-				Integer count = jobContext.getCacheCounts().remove(cacheKey);
-				if (count == null)
-					labelUpdates.add(entry.getKey() + "-");
-				else if (count != labelValue)
-					labelUpdates.add(entry.getKey() + "=" + count);
-			}
-		}
-		
-		for (Map.Entry<String, Integer> entry: jobContext.getCacheCounts().entrySet())
-			labelUpdates.add(CACHE_LABEL_PREFIX + entry.getKey() + "=" + entry.getValue());
-		
+		labelUpdates(jobContext, labelUpdates, it);
 		jobContext.getCacheCounts().clear();
 		
 		for (List<String> partition: Lists.partition(labelUpdates, LABEL_UPDATE_BATCH)) {
@@ -1164,6 +1149,25 @@ public class KubernetesExecutor extends JobExecutor implements Testable<TestData
 			});
 			if (!labelNotFound.get())
 				result.checkReturnCode();
+		}
+	}
+
+	private void labelUpdates(JobContext jobContext, List<String> labelUpdates,
+			Iterator<Map.Entry<String, JsonNode>> it) {
+		while (it.hasNext()) {
+			Map.Entry<String, JsonNode> entry = it.next();
+			if (entry.getKey().startsWith(CACHE_LABEL_PREFIX)) {
+				String cacheKey = entry.getKey().substring(CACHE_LABEL_PREFIX.length());
+				int labelValue = entry.getValue().asInt();
+				Integer count = jobContext.getCacheCounts().remove(cacheKey);
+				if (count == null)
+					labelUpdates.add(entry.getKey() + "-");
+				else if (count != labelValue)
+					labelUpdates.add(entry.getKey() + "=" + count);
+			}
+		}
+		for (Map.Entry<String, Integer> entry : jobContext.getCacheCounts().entrySet()) {
+			labelUpdates.add(CACHE_LABEL_PREFIX + entry.getKey() + "=" + entry.getValue());
 		}
 	}
 	
@@ -1272,62 +1276,13 @@ public class KubernetesExecutor extends JobExecutor implements Testable<TestData
 	}
 	
 	private void checkEventError(String namespace, String podName, SimpleLogger jobLogger) {
+		AtomicReference<KubernetesExecutor.StopWatch> stopWatchRef = stopWatchRef(jobLogger);
 		Commandline kubectl = newKubeCtl();
 		
-		ObjectMapper mapper = OneDev.getInstance(ObjectMapper.class);
-		
-		StringBuilder json = new StringBuilder();
 		kubectl.addArgs("get", "event", "-n", namespace, "--field-selector", 
 				"involvedObject.kind=Pod,involvedObject.name=" + podName, "--watch", 
 				"-o", "json");
-		Thread thread = Thread.currentThread();
-		AtomicReference<StopWatch> stopWatchRef = new AtomicReference<>(null);
 		try {
-			kubectl.execute(new LineConsumer() {
-	
-				@Override
-				public void consume(String line) {
-					if (stopWatchRef.get() == null) {
-						if (line.startsWith("{")) {
-							json.append("{").append("\n");
-						} else if (line.startsWith("}")) {
-							json.append("}");
-							logger.trace("Checking event:\n" + json.toString());
-							try {
-								JsonNode eventNode = mapper.readTree(json.toString()); 
-								String type = eventNode.get("type").asText();
-								String reason = eventNode.get("reason").asText();
-								JsonNode messageNode = eventNode.get("message");
-								String message = messageNode!=null? messageNode.asText(): reason;
-								if (type.equals("Warning")) {
-									if (reason.equals("FailedScheduling"))
-										jobLogger.log("Kubernetes: " + message);
-									else 
-										stopWatchRef.set(new StopWatch(new ExplicitException(message)));
-								} else if (type.equals("Normal") && reason.equals("Started")) {
-									stopWatchRef.set(new StopWatch(null));
-								}
-								if (stopWatchRef.get() != null)
-									thread.interrupt();
-							} catch (Exception e) {
-								logger.error("Error processing event watching record", e);
-							}
-							json.setLength(0);
-						} else {
-							json.append(line).append("\n");
-						}
-					}
-				}
-				
-			}, new LineConsumer() {
-	
-				@Override
-				public void consume(String line) {
-					jobLogger.log("Kubernetes: " + line);
-				}
-				
-			}).checkReturnCode();
-			
 			throw new ExplicitException("Unexpected end of event watching");
 		} catch (Exception e) {
 			StopWatch stopWatch = stopWatchRef.get();
@@ -1338,6 +1293,55 @@ public class KubernetesExecutor extends JobExecutor implements Testable<TestData
 				throw ExceptionUtils.unchecked(e);
 			}
 		}		
+	}
+
+	private AtomicReference<KubernetesExecutor.StopWatch> stopWatchRef(SimpleLogger jobLogger) {
+		Commandline kubectl = newKubeCtl();
+		ObjectMapper mapper = OneDev.getInstance(ObjectMapper.class);
+		StringBuilder json = new StringBuilder();
+		Thread thread = Thread.currentThread();
+		AtomicReference<StopWatch> stopWatchRef = new AtomicReference<>(null);
+		kubectl.execute(new LineConsumer() {
+			@Override
+			public void consume(String line) {
+				if (stopWatchRef.get() == null) {
+					if (line.startsWith("{")) {
+						json.append("{").append("\n");
+					} else if (line.startsWith("}")) {
+						json.append("}");
+						logger.trace("Checking event:\n" + json.toString());
+						try {
+							JsonNode eventNode = mapper.readTree(json.toString());
+							String type = eventNode.get("type").asText();
+							String reason = eventNode.get("reason").asText();
+							JsonNode messageNode = eventNode.get("message");
+							String message = messageNode != null ? messageNode.asText() : reason;
+							if (type.equals("Warning")) {
+								if (reason.equals("FailedScheduling"))
+									jobLogger.log("Kubernetes: " + message);
+								else
+									stopWatchRef.set(new StopWatch(new ExplicitException(message)));
+							} else if (type.equals("Normal") && reason.equals("Started")) {
+								stopWatchRef.set(new StopWatch(null));
+							}
+							if (stopWatchRef.get() != null)
+								thread.interrupt();
+						} catch (Exception e) {
+							logger.error("Error processing event watching record", e);
+						}
+						json.setLength(0);
+					} else {
+						json.append(line).append("\n");
+					}
+				}
+			}
+		}, new LineConsumer() {
+			@Override
+			public void consume(String line) {
+				jobLogger.log("Kubernetes: " + line);
+			}
+		}).checkReturnCode();
+		return stopWatchRef;
 	}
 	
 	private void collectContainerLog(String namespace, String podName, String containerName, 
