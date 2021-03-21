@@ -114,6 +114,8 @@ import io.onedev.server.util.script.identity.ScriptIdentity;
 @Singleton
 public class DefaultJobManager implements JobManager, Runnable, CodePullAuthorizationSource {
 
+	private DefaultJobManagerProduct defaultJobManagerProduct;
+
 	private static final int CHECK_INTERVAL = 1000; // check internal in milli-seconds
 	
 	private static final Logger logger = LoggerFactory.getLogger(DefaultJobManager.class);
@@ -121,8 +123,6 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 	private final Map<String, JobContext> jobContexts = new ConcurrentHashMap<>();
 	
 	private final Map<Long, JobExecution> jobExecutions = new ConcurrentHashMap<>();
-	
-	private final Map<Long, Collection<String>> scheduledTasks = new ConcurrentHashMap<>();
 	
 	private final ProjectManager projectManager;
 	
@@ -144,19 +144,16 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 	
 	private final BuildParamManager buildParamManager;
 	
-	private final TaskScheduler taskScheduler;
-	
 	private final Validator validator;
 	
 	private volatile List<JobExecutor> jobExecutors;
-	
-	private volatile Thread thread;
 	
 	@Inject
 	public DefaultJobManager(BuildManager buildManager, UserManager userManager, ListenerRegistry listenerRegistry, 
 			SettingManager settingManager, TransactionManager transactionManager, LogManager logManager, 
 			ExecutorService executorService, SessionManager sessionManager, BuildParamManager buildParamManager, 
 			ProjectManager projectManager, Validator validator, TaskScheduler taskScheduler) {
+		this.defaultJobManagerProduct = new DefaultJobManagerProduct(taskScheduler);
 		this.settingManager = settingManager;
 		this.buildManager = buildManager;
 		this.userManager = userManager;
@@ -168,7 +165,6 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 		this.buildParamManager = buildParamManager;
 		this.projectManager = projectManager;
 		this.validator = validator;
-		this.taskScheduler = taskScheduler;
 	}
 
 	private void validate(Project project, ObjectId commitId) {
@@ -788,8 +784,8 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 	@Listen
 	public void on(SystemStarted event) {
 		jobExecutors = settingManager.getJobExecutors();
-		thread = new Thread(this);
-		thread.start();	
+		defaultJobManagerProduct.setThread(new Thread(this));
+		defaultJobManagerProduct.getThread().start();	
 		
 		for (Project project: projectManager.query())
 			schedule(project);
@@ -798,19 +794,7 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 	@Transactional
 	@Listen
 	public void on(EntityRemoved event) {
-		if (event.getEntity() instanceof Project) {
-			Long projectId = ((Project) event.getEntity()).getId();
-			transactionManager.runAfterCommit(new Runnable() {
-
-				@Override
-				public void run() {
-					Collection<String> tasksOfProject = scheduledTasks.remove(projectId);
-					if (tasksOfProject != null) 
-						tasksOfProject.stream().forEach(it->taskScheduler.unschedule(it));
-				}
-				
-			});
-		}
+		defaultJobManagerProduct.on(event, this.transactionManager);
 	}
 
 	@Sessional
@@ -862,7 +846,7 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 									ScheduleTrigger scheduledTrigger = (ScheduleTrigger) trigger;
 									SubmitReason reason = trigger.matches(event, job);
 									if (reason != null) {
-										String taskId = taskScheduler.schedule(newSchedulableTask(project, commitId, job, scheduledTrigger, reason));
+										String taskId = defaultJobManagerProduct.getTaskScheduler().schedule(newSchedulableTask(project, commitId, job, scheduledTrigger, reason));
 										tasksOfProject.add(taskId);
 									}
 								}
@@ -874,9 +858,9 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 		} catch (Exception e) {
 			logger.error("Error scheduling project '" + project.getName() + "'", e);
 		} finally {
-			tasksOfProject = scheduledTasks.put(project.getId(), tasksOfProject);
+			tasksOfProject = defaultJobManagerProduct.getScheduledTasks().put(project.getId(), tasksOfProject);
 			if (tasksOfProject != null)
-				tasksOfProject.stream().forEach(it->taskScheduler.unschedule(it));
+				tasksOfProject.stream().forEach(it->defaultJobManagerProduct.getTaskScheduler().unschedule(it));
 		}
 	}
 
@@ -919,21 +903,12 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 	
 	@Listen
 	public void on(SystemStopping event) {
-		if (thread != null) {
-			Thread copy = thread;
-			thread = null;
-			try {
-				copy.join();
-			} catch (InterruptedException e) {
-			}
-		}
-		scheduledTasks.values().stream().forEach(it1->it1.stream().forEach(it2->taskScheduler.unschedule(it2)));
-		scheduledTasks.clear();
+		defaultJobManagerProduct.on(event);
 	}
 
 	@Override
 	public void run() {
-		while (!jobExecutions.isEmpty() || thread != null) {
+		while (!jobExecutions.isEmpty() || defaultJobManagerProduct.getThread() != null) {
 			try {
 				synchronized (this) {
 					transactionManager.run(new Runnable() {
@@ -946,7 +921,7 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 									if (execution != null) {
 										if (execution.isTimedout())
 											execution.cancel(null);
-									} else if (thread != null) {
+									} else if (defaultJobManagerProduct.getThread() != null) {
 										try {
 											jobExecutions.put(build.getId(), execute(build));
 										} catch (Throwable t) {
@@ -959,7 +934,7 @@ public class DefaultJobManager implements JobManager, Runnable, CodePullAuthoriz
 								} else if (build.getStatus() == Build.Status.WAITING) {
 									if (build.getRetryDate() != null) {
 										JobExecution execution = jobExecutions.get(build.getId());
-										if (execution == null && thread != null) {
+										if (execution == null && defaultJobManagerProduct.getThread() != null) {
 											build.setStatus(Build.Status.PENDING);
 											build.setPendingDate(new Date());
 											listenerRegistry.post(new BuildPending(build));
